@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "skillfish": {
+      "url": "${CLAUDE_PLUGIN_OPTION_toolkit_url}",
+      "headers": {
+        "Authorization": "Bearer ${CLAUDE_PLUGIN_OPTION_api_token}"
+      }
+    }
+  }
+}

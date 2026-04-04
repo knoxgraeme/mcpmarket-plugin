@@ -1,0 +1,14 @@
+{
+  "name": "skillfish",
+  "description": "Connect Claude Code to your Skillfish workspace — syncs skills, toolkits, and MCP tools.",
+  "owner": {
+    "name": "Skillfish",
+    "url": "https://skillfish.com"
+  },
+  "plugins": [
+    {
+      "name": "skillfish",
+      "source": "./"
+    }
+  ]
+}
