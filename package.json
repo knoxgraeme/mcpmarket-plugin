@@ -1,0 +1,8 @@
+{
+  "name": "skillfish-plugin",
+  "private": true,
+  "scripts": {
+    "test": "echo 'No tests'",
+    "lint": "echo 'No linting'"
+  }
+}
