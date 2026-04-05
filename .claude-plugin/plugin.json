@@ -23,7 +23,7 @@
       "title": "API Token",
       "description": "Your Skillfish API token (sk_user_...)",
       "type": "string",
-      "sensitive": true
+      "sensitive": false
     },
     "api_url": {
       "title": "API Base URL (optional)",
