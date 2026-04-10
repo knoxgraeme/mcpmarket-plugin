@@ -1,0 +1,6 @@
+.DS_Store
+test-plugin/
+test-plugin*/
+skillfish/
+*.zip
+*.plugin

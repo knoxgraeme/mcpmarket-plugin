@@ -3,27 +3,36 @@
 # Called by SessionStart hook — fetches baseline skills from the web app API
 # and writes them to the plugin's skills/ directory for auto-loading.
 #
-# Env vars (set by Claude Code plugin system):
-#   CLAUDE_PLUGIN_OPTION_toolkit_url  — MCP endpoint URL (e.g. https://gateway.mcpmarket.com/org/toolkits/slug/mcp)
-#   CLAUDE_PLUGIN_OPTION_api_token    — API token (sk_user_...)
-#   CLAUDE_PLUGIN_ROOT                — Plugin root directory
+# Reads credentials from:
+#   1. CLAUDE_PLUGIN_OPTION_* env vars (CLI plugin install with userConfig)
+#   2. .mcp.json in plugin root (downloaded zip with baked-in credentials)
 
 set -euo pipefail
 
-API_BASE_URL="${CLAUDE_PLUGIN_OPTION_api_url:-https://app.mcpmarket.com}"
-TOOLKIT_URL="${CLAUDE_PLUGIN_OPTION_toolkit_url:-}"
-API_TOKEN="${CLAUDE_PLUGIN_OPTION_api_token:-}"
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-}"
 
-# Validate required env vars
-if [ -z "$TOOLKIT_URL" ] || [ -z "$API_TOKEN" ] || [ -z "$PLUGIN_ROOT" ]; then
-  echo "Skillfish sync: missing configuration — skipping sync" >&2
+# Check for jq early — needed for .mcp.json fallback and API response parsing
+if ! command -v jq &>/dev/null; then
+  echo "Skillfish sync: jq not installed — skipping sync" >&2
   exit 0
 fi
 
-# Check for jq
-if ! command -v jq &>/dev/null; then
-  echo "Skillfish sync: jq not installed — skipping sync" >&2
+# Read from .mcp.json if env vars aren't set (baked-in credentials from download)
+if [ -n "$PLUGIN_ROOT" ] && [ -f "$PLUGIN_ROOT/.mcp.json" ]; then
+  MCP_CONFIG="$PLUGIN_ROOT/.mcp.json"
+  TOOLKIT_URL="${CLAUDE_PLUGIN_OPTION_toolkit_url:-$(jq -r '.mcpServers.skillfish.url // empty' "$MCP_CONFIG")}"
+  BEARER=$(jq -r '.mcpServers.skillfish.headers.Authorization // empty' "$MCP_CONFIG")
+  API_TOKEN="${CLAUDE_PLUGIN_OPTION_api_token:-${BEARER#Bearer }}"
+else
+  TOOLKIT_URL="${CLAUDE_PLUGIN_OPTION_toolkit_url:-}"
+  API_TOKEN="${CLAUDE_PLUGIN_OPTION_api_token:-}"
+fi
+
+API_BASE_URL="${CLAUDE_PLUGIN_OPTION_api_url:-https://app.mcpmarket.com}"
+
+# Validate required values
+if [ -z "$TOOLKIT_URL" ] || [ -z "$API_TOKEN" ] || [ -z "$PLUGIN_ROOT" ]; then
+  echo "Skillfish sync: missing configuration — skipping sync" >&2
   exit 0
 fi
 
@@ -136,11 +145,16 @@ for i in $(seq 0 $((SKILL_COUNT - 1))); do
   echo "$VERSION" > "$VERSION_FILE"
 done
 
-# Remove skills no longer marked as baseline
+# Remove skills no longer marked as baseline (skip bundled plugin skills)
+BUNDLED_SKILLS="sync"
 if [ -d "$SKILLS_DIR" ] && [ "$SKILLS_DIR" != "/" ]; then
   for EXISTING in "$SKILLS_DIR"/*/; do
     [ -d "$EXISTING" ] || continue
     EXISTING_SLUG=$(basename "$EXISTING")
+    # Skip bundled skills that ship with the plugin
+    case " $BUNDLED_SKILLS " in
+      *" $EXISTING_SLUG "*) continue ;;
+    esac
     FOUND=false
     for S in "${SYNCED_SLUGS[@]:-}"; do
       if [ "$S" = "$EXISTING_SLUG" ]; then

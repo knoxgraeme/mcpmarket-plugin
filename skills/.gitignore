@@ -2,3 +2,5 @@
 *
 !.gitkeep
 !.gitignore
+!sync/
+!sync/**
