@@ -1,12 +1,12 @@
 {
-  "name": "skillfish",
+  "name": "mcpmarket",
   "owner": {
-    "name": "Skillfish",
-    "url": "https://skillfish.com"
+    "name": "MCPmarket",
+    "url": "https://mcpmarket.com"
   },
   "plugins": [
     {
-      "name": "skillfish",
+      "name": "mcpmarket",
       "source": "./"
     }
   ]

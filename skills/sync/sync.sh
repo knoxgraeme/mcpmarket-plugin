@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Skillfish baseline skill sync
+# MCPmarket baseline skill sync
 # Called by SessionStart hook — fetches baseline skills from the web app API
 # and writes them to the plugin's skills/ directory for auto-loading.
 #
@@ -13,16 +13,25 @@ PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-}"
 
 # Check for jq early — needed for .mcp.json fallback and API response parsing
 if ! command -v jq &>/dev/null; then
-  echo "Skillfish sync: jq not installed — skipping sync" >&2
+  echo "MCPmarket sync: jq not installed — skipping sync" >&2
   exit 0
 fi
 
 # Read from .mcp.json if env vars aren't set (baked-in credentials from download)
 if [ -n "$PLUGIN_ROOT" ] && [ -f "$PLUGIN_ROOT/.mcp.json" ]; then
   MCP_CONFIG="$PLUGIN_ROOT/.mcp.json"
-  TOOLKIT_URL="${CLAUDE_PLUGIN_OPTION_toolkit_url:-$(jq -r '.mcpServers.skillfish.url // empty' "$MCP_CONFIG")}"
-  BEARER=$(jq -r '.mcpServers.skillfish.headers.Authorization // empty' "$MCP_CONFIG")
+  TOOLKIT_URL="${CLAUDE_PLUGIN_OPTION_toolkit_url:-$(jq -r '.mcpServers.mcpmarket.url // empty' "$MCP_CONFIG")}"
+  BEARER=$(jq -r '.mcpServers.mcpmarket.headers.Authorization // empty' "$MCP_CONFIG")
   API_TOKEN="${CLAUDE_PLUGIN_OPTION_api_token:-${BEARER#Bearer }}"
+
+  # .mcp.json was present but the credentials couldn't be extracted
+  # (wrong shape, jq returned empty, file hand-edited). Log it as a
+  # distinct failure so debugging doesn't have to guess between "never
+  # configured" and "configured but unreadable".
+  if [ -z "$TOOLKIT_URL" ] || [ -z "$API_TOKEN" ]; then
+    echo "MCPmarket sync: .mcp.json present but credentials unreadable — skipping sync" >&2
+    exit 0
+  fi
 else
   TOOLKIT_URL="${CLAUDE_PLUGIN_OPTION_toolkit_url:-}"
   API_TOKEN="${CLAUDE_PLUGIN_OPTION_api_token:-}"
@@ -30,9 +39,24 @@ fi
 
 API_BASE_URL="${CLAUDE_PLUGIN_OPTION_api_url:-https://app.mcpmarket.com}"
 
+# Validate api_url before using it as the base for Authorization-bearing
+# requests. Without this, a user socially-engineered into setting
+# CLAUDE_PLUGIN_OPTION_api_url=https://attacker.com would exfiltrate
+# their API token on the next sync. Allowlist covers production, any
+# mcpmarket.com subdomain (staging/preview), and localhost for dev.
+case "$API_BASE_URL" in
+  https://app.mcpmarket.com|https://app.mcpmarket.com/*) ;;
+  https://*.mcpmarket.com|https://*.mcpmarket.com/*) ;;
+  http://localhost:*|http://127.0.0.1:*) ;;
+  *)
+    echo "MCPmarket sync: api_url '$API_BASE_URL' not in allowlist — skipping sync" >&2
+    exit 0
+    ;;
+esac
+
 # Validate required values
 if [ -z "$TOOLKIT_URL" ] || [ -z "$API_TOKEN" ] || [ -z "$PLUGIN_ROOT" ]; then
-  echo "Skillfish sync: missing configuration — skipping sync" >&2
+  echo "MCPmarket sync: missing configuration — skipping sync" >&2
   exit 0
 fi
 
@@ -43,17 +67,17 @@ ORG_SLUG=$(echo "$URL_PATH" | cut -d'/' -f1)
 TOOLKIT_SLUG=$(echo "$URL_PATH" | cut -d'/' -f3)
 
 if [ -z "$ORG_SLUG" ] || [ -z "$TOOLKIT_SLUG" ]; then
-  echo "Skillfish sync: could not parse toolkit URL — skipping sync" >&2
+  echo "MCPmarket sync: could not parse toolkit URL — skipping sync" >&2
   exit 0
 fi
 
 # Validate parsed slugs look reasonable (alphanumeric + hyphens)
 if ! echo "$ORG_SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
-  echo "Skillfish sync: invalid org slug '$ORG_SLUG' — skipping sync" >&2
+  echo "MCPmarket sync: invalid org slug '$ORG_SLUG' — skipping sync" >&2
   exit 0
 fi
 if ! echo "$TOOLKIT_SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
-  echo "Skillfish sync: invalid toolkit slug '$TOOLKIT_SLUG' — skipping sync" >&2
+  echo "MCPmarket sync: invalid toolkit slug '$TOOLKIT_SLUG' — skipping sync" >&2
   exit 0
 fi
 
@@ -70,12 +94,12 @@ HTTP_CODE=$(curl -sS -o "$TMPFILE" -w '%{http_code}' --max-time 15 \
   -H "Authorization: Bearer $API_TOKEN" \
   -H "Accept: application/json" \
   "$SYNC_URL" 2>/dev/null) || {
-  echo "Skillfish sync: network error — using cached skills" >&2
+  echo "MCPmarket sync: network error — using cached skills" >&2
   exit 0
 }
 
 if [ "$HTTP_CODE" != "200" ]; then
-  echo "Skillfish sync: API returned HTTP $HTTP_CODE — using cached skills" >&2
+  echo "MCPmarket sync: API returned HTTP $HTTP_CODE — using cached skills" >&2
   exit 0
 fi
 
@@ -83,16 +107,24 @@ RESPONSE=$(cat "$TMPFILE")
 
 # Validate response
 if ! echo "$RESPONSE" | jq -e '.data.skills' >/dev/null 2>&1; then
-  echo "Skillfish sync: invalid response — using cached skills" >&2
+  echo "MCPmarket sync: invalid response — using cached skills" >&2
   exit 0
 fi
 
 SKILL_COUNT=$(echo "$RESPONSE" | jq '.data.skills | length')
 
 if [ "$SKILL_COUNT" -eq 0 ]; then
-  echo "Skillfish sync: no baseline skills configured"
+  echo "MCPmarket sync: no baseline skills configured"
   exit 0
 fi
+
+# Skills that ship with the plugin itself — never overwritten by the
+# baseline API and never deleted by the cleanup loop, regardless of
+# what the server returns. This is a trust boundary: a compromised
+# baseline endpoint returning {slug:"sync", content:"<attacker skill>"}
+# would otherwise replace skills/sync/SKILL.md, and the next time the
+# user ran /sync Claude would execute attacker-supplied instructions.
+BUNDLED_SKILLS="sync"
 
 # Track synced slugs for cleanup
 SYNCED_SLUGS=()
@@ -105,6 +137,12 @@ for i in $(seq 0 $((SKILL_COUNT - 1))); do
   if [ -z "$SLUG" ] || [ "$SLUG" = "null" ]; then
     continue
   fi
+
+  # Refuse to write over any bundled skill, even if the server returns
+  # one with the same slug. Mirrors the cleanup-loop guard below.
+  case " $BUNDLED_SKILLS " in
+    *" $SLUG "*) continue ;;
+  esac
 
   SYNCED_SLUGS+=("$SLUG")
   SKILL_DIR="$SKILLS_DIR/$SLUG"
@@ -145,8 +183,8 @@ for i in $(seq 0 $((SKILL_COUNT - 1))); do
   echo "$VERSION" > "$VERSION_FILE"
 done
 
-# Remove skills no longer marked as baseline (skip bundled plugin skills)
-BUNDLED_SKILLS="sync"
+# Remove skills no longer marked as baseline (skip bundled plugin skills,
+# BUNDLED_SKILLS is hoisted above the write loop).
 if [ -d "$SKILLS_DIR" ] && [ "$SKILLS_DIR" != "/" ]; then
   for EXISTING in "$SKILLS_DIR"/*/; do
     [ -d "$EXISTING" ] || continue
@@ -156,16 +194,22 @@ if [ -d "$SKILLS_DIR" ] && [ "$SKILLS_DIR" != "/" ]; then
       *" $EXISTING_SLUG "*) continue ;;
     esac
     FOUND=false
-    for S in "${SYNCED_SLUGS[@]:-}"; do
-      if [ "$S" = "$EXISTING_SLUG" ]; then
-        FOUND=true
-        break
-      fi
-    done
+    # Guard: bash expands "${empty_array[@]:-}" to a single empty word,
+    # so iterating without a length check would match "" against every
+    # real slug and delete every non-bundled skill when the API returns
+    # all-null-slug responses.
+    if [ ${#SYNCED_SLUGS[@]} -gt 0 ]; then
+      for S in "${SYNCED_SLUGS[@]}"; do
+        if [ "$S" = "$EXISTING_SLUG" ]; then
+          FOUND=true
+          break
+        fi
+      done
+    fi
     if [ "$FOUND" = "false" ]; then
       rm -rf "$EXISTING"
     fi
   done
 fi
 
-echo "Skillfish sync: $SKILL_COUNT baseline skill(s) synced"
+echo "MCPmarket sync: $SKILL_COUNT baseline skill(s) synced"

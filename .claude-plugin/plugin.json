@@ -1,30 +1,30 @@
 {
-  "name": "skillfish",
+  "name": "mcpmarket",
   "version": "0.1.0",
-  "description": "Connect your Claude Code sessions to Skillfish skills via MCP. Syncs baseline skills to local filesystem and provides on-demand skill search.",
+  "description": "Connect your Claude Code sessions to MCPmarket skills via MCP. Syncs baseline skills to local filesystem and provides on-demand skill search.",
   "author": {
-    "name": "Skillfish",
-    "url": "https://skillfish.com"
+    "name": "MCPmarket",
+    "url": "https://mcpmarket.com"
   },
   "repository": "https://github.com/knoxgraeme/mcpmarket-plugin",
-  "homepage": "https://skillfish.com",
+  "homepage": "https://mcpmarket.com",
   "license": "MIT",
-  "keywords": ["skills", "mcp", "skillfish", "toolkit"],
+  "keywords": ["skills", "mcp", "mcpmarket", "toolkit"],
   "hooks": "./hooks/hooks.json",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "userConfig": {
     "toolkit_url": {
       "title": "Toolkit MCP URL",
-      "description": "Your Skillfish toolkit MCP URL (e.g., https://gateway.mcpmarket.com/my-org/toolkits/my-workspace/mcp)",
+      "description": "Your MCPmarket toolkit MCP URL (e.g., https://gateway.mcpmarket.com/my-org/toolkits/my-workspace/mcp)",
       "type": "string",
       "sensitive": false
     },
     "api_token": {
       "title": "API Token",
-      "description": "Your Skillfish API token (sk_user_...)",
+      "description": "Your MCPmarket API token (sk_user_...)",
       "type": "string",
-      "sensitive": false
+      "sensitive": true
     },
     "api_url": {
       "title": "API Base URL (optional)",
