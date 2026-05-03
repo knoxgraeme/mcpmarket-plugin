@@ -9,7 +9,16 @@
 
 set -euo pipefail
 
+# CLAUDE_PLUGIN_ROOT is set by Claude Code when running plugin hooks, but
+# not when the script is invoked through the Bash tool from the /sync
+# skill. Fall back to deriving the plugin root from this script's own
+# location (skills/sync/sync.sh → ../..) so /sync works the same as the
+# SessionStart hook.
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-}"
+if [ -z "$PLUGIN_ROOT" ]; then
+  SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  PLUGIN_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+fi
 
 # Check for jq early — needed for .mcp.json fallback and API response parsing
 if ! command -v jq &>/dev/null; then
