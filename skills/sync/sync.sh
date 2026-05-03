@@ -157,13 +157,28 @@ for i in $(seq 0 $((SKILL_COUNT - 1))); do
   SKILL_DIR="$SKILLS_DIR/$SLUG"
   mkdir -p "$SKILL_DIR"
 
-  # Check if already up-to-date
-  VERSION_FILE="$SKILL_DIR/.version"
-  if [ -f "$VERSION_FILE" ] && [ "$(cat "$VERSION_FILE")" = "$VERSION" ]; then
+  # Check if already up-to-date by reading the canonical version stamp
+  # the server wrote into SKILL.md frontmatter at publish time
+  # (`metadata.mcpmarket-version`).  Single source of truth — no separate
+  # sidecar file means the version travels with the SKILL.md when
+  # teammates copy or commit the folder elsewhere.
+  LOCAL_VERSION=""
+  if [ -f "$SKILL_DIR/SKILL.md" ]; then
+    LOCAL_VERSION=$(awk '
+      /^---[[:space:]]*$/ { if (in_fm) { exit } else { in_fm=1; next } }
+      in_fm && /^[[:space:]]+mcpmarket-version:/ {
+        sub(/^[[:space:]]+mcpmarket-version:[[:space:]]*/, "")
+        gsub(/^["'\'']|["'\'']$/, "")
+        print; exit
+      }
+    ' "$SKILL_DIR/SKILL.md")
+  fi
+  if [ -n "$LOCAL_VERSION" ] && [ "$LOCAL_VERSION" = "$VERSION" ]; then
     continue
   fi
 
-  # Write entry point (SKILL.md)
+  # Write entry point (SKILL.md) — version stamp is already in the
+  # content the API returned, no separate file write needed.
   CONTENT=$(echo "$SKILL" | jq -r '.content')
   if [ -n "$CONTENT" ] && [ "$CONTENT" != "null" ]; then
     printf '%s\n' "$CONTENT" > "$SKILL_DIR/SKILL.md"
@@ -189,7 +204,9 @@ for i in $(seq 0 $((SKILL_COUNT - 1))); do
     printf '%s\n' "$FILE_CONTENT" > "$SKILL_DIR/$FILE_PATH"
   done
 
-  echo "$VERSION" > "$VERSION_FILE"
+  # Opportunistic cleanup of pre-frontmatter sidecar files left over
+  # from earlier plugin versions.  Idempotent.
+  rm -f "$SKILL_DIR/.version"
 done
 
 # Remove skills no longer marked as baseline (skip bundled plugin skills,
