@@ -1,0 +1,16 @@
+{
+  "name": "mcpmarket",
+  "version": "0.1.0",
+  "description": "Connect your Codex CLI sessions to MCPmarket skills via MCP. Syncs baseline skills to local filesystem and provides on-demand skill search.",
+  "author": {
+    "name": "MCPmarket",
+    "url": "https://mcpmarket.com"
+  },
+  "repository": "https://github.com/knoxgraeme/mcpmarket-plugin",
+  "homepage": "https://mcpmarket.com",
+  "license": "MIT",
+  "keywords": ["skills", "mcp", "mcpmarket", "toolkit", "codex"],
+  "hooks": "./hooks/hooks.json",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}

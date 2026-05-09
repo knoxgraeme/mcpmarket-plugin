@@ -10,7 +10,6 @@
   "homepage": "https://mcpmarket.com",
   "license": "MIT",
   "keywords": ["skills", "mcp", "mcpmarket", "toolkit"],
-  "hooks": "./hooks/hooks.json",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "userConfig": {

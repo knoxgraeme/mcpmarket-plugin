@@ -1,0 +1,33 @@
+{
+  "name": "mcpmarket",
+  "version": "0.1.0",
+  "description": "Connect your Gemini CLI sessions to MCPmarket skills via MCP. Syncs baseline skills to local filesystem and provides on-demand skill search.",
+  "settings": [
+    {
+      "name": "API Token",
+      "description": "Your MCPmarket API token (sk_user_...)",
+      "envVar": "MCPMARKET_TOKEN",
+      "sensitive": true
+    },
+    {
+      "name": "Toolkit URL",
+      "description": "Your MCPmarket toolkit MCP URL (e.g., https://gateway.mcpmarket.com/my-org/toolkits/my-workspace/mcp)",
+      "envVar": "MCPMARKET_TOOLKIT_URL",
+      "sensitive": false
+    },
+    {
+      "name": "API Base URL (optional)",
+      "description": "Override the API base URL for local development (e.g., http://localhost:3000). Leave blank for production.",
+      "envVar": "MCPMARKET_API_URL",
+      "sensitive": false
+    }
+  ],
+  "mcpServers": {
+    "mcpmarket": {
+      "httpUrl": "${MCPMARKET_TOOLKIT_URL}",
+      "headers": {
+        "Authorization": "Bearer ${MCPMARKET_TOKEN}"
+      }
+    }
+  }
+}
