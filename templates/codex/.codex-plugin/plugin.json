@@ -1,5 +1,5 @@
 {
-  "name": "mcpmarket",
+  "name": "__MCPMARKET_PLUGIN_NAME__",
   "version": "0.1.0",
   "description": "Connect your Codex CLI sessions to MCPmarket skills via MCP. Syncs baseline skills to local filesystem and provides on-demand skill search.",
   "author": {

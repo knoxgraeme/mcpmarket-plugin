@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "mcpmarket": {
+    "__MCPMARKET_PLUGIN_NAME__": {
       "url": "${MCPMARKET_PLUGIN_TOOLKIT_URL}",
       "http_headers": {
         "Authorization": "Bearer ${MCPMARKET_PLUGIN_API_TOKEN}"

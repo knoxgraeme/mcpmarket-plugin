@@ -1,6 +1,6 @@
-[mcp_servers.mcpmarket]
+[mcp_servers.__MCPMARKET_PLUGIN_NAME__]
 url = "${MCPMARKET_PLUGIN_TOOLKIT_URL}"
 bearer_token_env_var = "MCPMARKET_TOKEN"
 
-[mcp_servers.mcpmarket.http_headers]
+[mcp_servers.__MCPMARKET_PLUGIN_NAME__.http_headers]
 Authorization = "Bearer ${MCPMARKET_PLUGIN_API_TOKEN}"

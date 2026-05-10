@@ -1,5 +1,5 @@
 {
-  "name": "mcpmarket",
+  "name": "__MCPMARKET_PLUGIN_NAME__",
   "version": "0.1.0",
   "description": "Connect your Gemini CLI sessions to MCPmarket skills via MCP. Syncs baseline skills to local filesystem and provides on-demand skill search.",
   "settings": [
@@ -23,7 +23,7 @@
     }
   ],
   "mcpServers": {
-    "mcpmarket": {
+    "__MCPMARKET_PLUGIN_NAME__": {
       "httpUrl": "${MCPMARKET_TOOLKIT_URL}",
       "headers": {
         "Authorization": "Bearer ${MCPMARKET_TOKEN}"

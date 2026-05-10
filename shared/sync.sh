@@ -34,13 +34,19 @@ fi
 
 if [ -n "$PLUGIN_ROOT" ] && [ -f "$PLUGIN_ROOT/.mcp.json" ]; then
   MCP_CONFIG="$PLUGIN_ROOT/.mcp.json"
-  # Codex uses `http_headers`; Claude uses `headers`. Try both. Use
-  # \x1F (Unit Separator, non-whitespace) so an empty leading field is
-  # preserved — tab would be stripped as IFS whitespace.
+  # Read the single MCP server entry — each plugin's .mcp.json holds
+  # exactly one server, keyed by the per-toolkit plugin name
+  # (`mcpmarket-<slug>`). Reading the only key under `mcpServers`
+  # avoids threading the slug into this script. Codex uses
+  # `http_headers`; Claude uses `headers`. Try both. Use \x1F (Unit
+  # Separator, non-whitespace) so an empty leading field is preserved
+  # — tab would be stripped as IFS whitespace.
   MCP_FIELDS=$(MCP_CONFIG_PATH="$MCP_CONFIG" node -e '
     try {
       const cfg = JSON.parse(require("fs").readFileSync(process.env.MCP_CONFIG_PATH, "utf8"));
-      const s = (cfg && cfg.mcpServers && cfg.mcpServers.mcpmarket) || {};
+      const servers = (cfg && cfg.mcpServers) || {};
+      const keys = Object.keys(servers);
+      const s = keys.length === 1 ? servers[keys[0]] : {};
       const url = s.url || "";
       const auth = (s.http_headers && s.http_headers.Authorization) || (s.headers && s.headers.Authorization) || "";
       process.stdout.write(url + "\x1F" + auth);

@@ -1,12 +1,12 @@
 {
-  "name": "mcpmarket",
+  "name": "__MCPMARKET_PLUGIN_NAME__",
   "owner": {
     "name": "MCPmarket",
     "url": "https://mcpmarket.com"
   },
   "plugins": [
     {
-      "name": "mcpmarket",
+      "name": "__MCPMARKET_PLUGIN_NAME__",
       "source": "./"
     }
   ]
