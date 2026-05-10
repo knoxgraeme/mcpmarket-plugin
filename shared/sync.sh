@@ -20,6 +20,17 @@ set -euo pipefail
 MCPMARKET_SYNC_VERSION="0.2.0"
 USER_AGENT="mcpmarket-sync/${MCPMARKET_SYNC_VERSION}"
 
+# Originating client surface (claude_desktop, claude_code, codex, gemini).
+# The download-time builder substitutes the placeholder before zipping
+# this script into the user's plugin. Curl-pipe install paths that do
+# not (yet) substitute leave the placeholder intact — sync.sh detects
+# that case below and omits the header so the baseline route records
+# nothing rather than a polluted "__MCPMARKET_CLIENT__" string.
+MCPMARKET_CLIENT="__MCPMARKET_CLIENT__"
+case "$MCPMARKET_CLIENT" in
+  __MCPMARKET_CLIENT__) MCPMARKET_CLIENT="" ;;
+esac
+
 # PLUGIN_ROOT is normally set by the hook-shim, but when this script is
 # invoked directly (e.g. from a /sync skill via the Bash tool) the env
 # var may be missing. Fall back to deriving the plugin root from this
@@ -113,10 +124,25 @@ TMPFILE=$(mktemp)
 CURL_ERR=$(mktemp)
 trap 'rm -f "$TMPFILE" "$CURL_ERR"' EXIT
 
+# Optional client header — only sent when the download-time substitution
+# baked in a real value. Omitting (rather than sending an empty header)
+# keeps curl's wire format clean and lets the baseline route's "header
+# present?" check stand in for "this install's client identity is known".
+#
+# `${arr[@]+"${arr[@]}"}` is the empty-array-safe expansion under
+# `set -u` — bash 4.2 (macOS default) treats a bare `${arr[@]}` on an
+# empty array as an unbound-variable error, which would abort the
+# script before curl ever ran.
+CLIENT_HEADER_ARGS=()
+if [ -n "$MCPMARKET_CLIENT" ]; then
+  CLIENT_HEADER_ARGS=(-H "X-MCPmarket-Client: $MCPMARKET_CLIENT")
+fi
+
 HTTP_CODE=$(curl -sS -o "$TMPFILE" -w '%{http_code}' --max-time 15 \
   -H "Authorization: Bearer $API_TOKEN" \
   -H "Accept: application/json" \
   -H "User-Agent: $USER_AGENT" \
+  ${CLIENT_HEADER_ARGS[@]+"${CLIENT_HEADER_ARGS[@]}"} \
   "$SYNC_URL" 2>"$CURL_ERR") || {
   # curl exit codes: 6 = could not resolve host, 7 = failed to connect,
   # 28 = timeout, 35/60 = TLS issues. Capture curl's own message so the
