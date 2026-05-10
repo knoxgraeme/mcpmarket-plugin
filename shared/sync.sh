@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # MCPmarket baseline skill sync (agent-neutral).
-# Run by an agent's SessionStart hook (via the agent's hook-shim) to
-# fetch baseline skills for the configured toolkit.
+# Run by an agent's SessionStart hook (via the agent's hook-shim).
 #
 # Reads only:
 #   MCPMARKET_PLUGIN_ROOT  (required) plugin install dir
@@ -12,37 +11,44 @@
 
 set -euo pipefail
 
-MCPMARKET_SYNC_VERSION="0.2.0"
+MCPMARKET_SYNC_VERSION="0.4.0"
 USER_AGENT="mcpmarket-sync/${MCPMARKET_SYNC_VERSION}"
 
-# Split-literal guard: do NOT collapse to a bare placeholder. The split
-# prevents the build-time substitution from rewriting this comparison
-# along with the assignment above, so unbaked (curl-pipe) installs still
-# detect the placeholder and zero the value.
+# Split literal so the build-time substitution can't rewrite the
+# comparison along with the assignment.
 MCPMARKET_CLIENT="__MCPMARKET_CLIENT__"
 if [ "$MCPMARKET_CLIENT" = "__MCPMARKET""_CLIENT__" ]; then
   MCPMARKET_CLIENT=""
 fi
 
-# Fall back to deriving plugin root from this script's location so
-# direct invocation (e.g. via /sync) works without env vars.
 PLUGIN_ROOT="${MCPMARKET_PLUGIN_ROOT:-}"
 if [ -z "$PLUGIN_ROOT" ]; then
   SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   PLUGIN_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 fi
 
-if ! command -v jq &>/dev/null; then
-  echo "MCPmarket sync: jq not installed — skipping sync" >&2
+if ! command -v node &>/dev/null; then
+  echo "MCPmarket sync: node not installed — skipping sync" >&2
   exit 0
 fi
 
 if [ -n "$PLUGIN_ROOT" ] && [ -f "$PLUGIN_ROOT/.mcp.json" ]; then
   MCP_CONFIG="$PLUGIN_ROOT/.mcp.json"
-  TOOLKIT_URL="${MCPMARKET_TOOLKIT_URL:-$(jq -r '.mcpServers.mcpmarket.url // empty' "$MCP_CONFIG")}"
-  # Codex uses `http_headers`; Claude uses `headers`. Try both.
-  BEARER=$(jq -r '.mcpServers.mcpmarket.http_headers.Authorization // .mcpServers.mcpmarket.headers.Authorization // empty' "$MCP_CONFIG")
-  API_TOKEN="${MCPMARKET_TOKEN:-${BEARER#Bearer }}"
+  # Codex uses `http_headers`; Claude uses `headers`. Try both. Use
+  # \x1F (Unit Separator, non-whitespace) so an empty leading field is
+  # preserved — tab would be stripped as IFS whitespace.
+  MCP_FIELDS=$(MCP_CONFIG_PATH="$MCP_CONFIG" node -e '
+    try {
+      const cfg = JSON.parse(require("fs").readFileSync(process.env.MCP_CONFIG_PATH, "utf8"));
+      const s = (cfg && cfg.mcpServers && cfg.mcpServers.mcpmarket) || {};
+      const url = s.url || "";
+      const auth = (s.http_headers && s.http_headers.Authorization) || (s.headers && s.headers.Authorization) || "";
+      process.stdout.write(url + "\x1F" + auth);
+    } catch { process.stdout.write("\x1F"); }
+  ')
+  IFS=$'\x1F' read -r MCP_URL MCP_AUTH <<<"$MCP_FIELDS"
+  TOOLKIT_URL="${MCPMARKET_TOOLKIT_URL:-$MCP_URL}"
+  API_TOKEN="${MCPMARKET_TOKEN:-${MCP_AUTH#Bearer }}"
 
   if [ -z "$TOOLKIT_URL" ] || [ -z "$API_TOKEN" ]; then
     echo "MCPmarket sync: .mcp.json present but credentials unreadable — skipping sync" >&2
@@ -55,17 +61,36 @@ fi
 
 API_BASE_URL="${MCPMARKET_API_URL:-https://app.mcpmarket.com}"
 
-# Allowlist API base URL — prevents token exfiltration if a user is
-# tricked into pointing MCPMARKET_API_URL at an attacker host.
+# Allowlist the API base URL by parsed host. `case` glob `*` matches
+# `/`, so a pattern like `https://*.mcpmarket.com/*` also matches
+# `https://attacker.com/foo.mcpmarket.com/bar` — splitting on `://`
+# and `/` removes that bypass.
+API_SCHEME=""
+API_HOST=""
 case "$API_BASE_URL" in
-  https://app.mcpmarket.com|https://app.mcpmarket.com/*) ;;
-  https://*.mcpmarket.com|https://*.mcpmarket.com/*) ;;
-  http://localhost:*|http://127.0.0.1:*) ;;
-  *)
-    echo "MCPmarket sync: api_url '$API_BASE_URL' not in allowlist — skipping sync" >&2
-    exit 0
-    ;;
+  https://*) API_SCHEME=https; API_HOST="${API_BASE_URL#https://}"; API_HOST="${API_HOST%%/*}" ;;
+  http://*)  API_SCHEME=http;  API_HOST="${API_BASE_URL#http://}";  API_HOST="${API_HOST%%/*}" ;;
 esac
+# Reject userinfo (@) and multi-colon hosts — `localhost:8080@evil.com`
+# would otherwise satisfy `localhost:*`.
+case "$API_HOST" in
+  *[!a-zA-Z0-9.:-]*) API_HOST="" ;;
+  *:*:*)             API_HOST="" ;;
+esac
+API_ALLOWED=false
+if [ "$API_SCHEME" = "https" ]; then
+  case "$API_HOST" in
+    app.mcpmarket.com|*.mcpmarket.com) API_ALLOWED=true ;;
+  esac
+elif [ "$API_SCHEME" = "http" ]; then
+  case "$API_HOST" in
+    localhost|localhost:*|127.0.0.1|127.0.0.1:*) API_ALLOWED=true ;;
+  esac
+fi
+if [ "$API_ALLOWED" != "true" ]; then
+  echo "MCPmarket sync: api_url '$API_BASE_URL' not in allowlist — skipping sync" >&2
+  exit 0
+fi
 
 if [ -z "$TOOLKIT_URL" ] || [ -z "$API_TOKEN" ] || [ -z "$PLUGIN_ROOT" ]; then
   echo "MCPmarket sync: missing configuration — skipping sync" >&2
@@ -94,9 +119,9 @@ fi
 SYNC_URL="${API_BASE_URL}/api/v1/plugin/baseline?org=${ORG_SLUG}&toolkit=${TOOLKIT_SLUG}"
 FAILURE_URL="${API_BASE_URL}/api/v1/plugin/sync-failure"
 
-# Fire-and-forget failure telemetry. Best-effort; cannot fail the hook.
-# Inlined JSON is safe only because reason is a hardcoded literal,
-# slugs are regex-validated, and http_code comes from curl's writer.
+# Fire-and-forget telemetry. Inlined JSON is safe only because reason
+# is a hardcoded literal, slugs are regex-validated, and http_code
+# comes from curl's writer.
 report_failure() {
   local reason="$1"
   local http_code="${2:-}"
@@ -124,8 +149,8 @@ TMPFILE=$(mktemp)
 CURL_ERR=$(mktemp)
 trap 'rm -f "$TMPFILE" "$CURL_ERR"' EXIT
 
-# `${arr[@]+"${arr[@]}"}` — empty-array-safe expansion under `set -u`
-# (bash 4.2 on macOS errors on bare `${arr[@]}` for empty arrays).
+# `${arr[@]+"${arr[@]}"}` is the empty-array-safe expansion under
+# `set -u` (bash 4.2 on macOS errors on bare `${arr[@]}` for empties).
 CLIENT_HEADER_ARGS=()
 if [ -n "$MCPMARKET_CLIENT" ]; then
   CLIENT_HEADER_ARGS=(-H "X-MCPmarket-Client: $MCPMARKET_CLIENT")
@@ -149,37 +174,64 @@ if [ "$HTTP_CODE" != "200" ]; then
   exit 0
 fi
 
-RESPONSE=$(cat "$TMPFILE")
-
-if ! echo "$RESPONSE" | jq -e '.data.skills' >/dev/null 2>&1; then
+# Single node pass emits TSV records the bash loop below consumes:
+#   S<TAB><slug><TAB><version><TAB><base64-content>
+#   F<TAB><slug><TAB><path><TAB><base64-content>
+# Rejects \t/\n/\x00 in string fields so a server can't forge extra
+# records by smuggling \n into a slug or path.
+RECORDS=$(node -e '
+  const UNSAFE = /[\t\n\x00]/;
+  let raw;
+  try { raw = require("fs").readFileSync(0, "utf8"); } catch { process.exit(1); }
+  let r;
+  try { r = JSON.parse(raw); } catch { process.exit(1); }
+  const skills = r && r.data && r.data.skills;
+  if (!Array.isArray(skills)) process.exit(1);
+  const out = [];
+  for (const s of skills) {
+    if (!s || typeof s.slug !== "string" || UNSAFE.test(s.slug)) continue;
+    const version = s.version || "";
+    if (UNSAFE.test(version)) continue;
+    const c = Buffer.from(s.content || "", "utf8").toString("base64");
+    out.push(["S", s.slug, version, c].join("\t"));
+    if (Array.isArray(s.files)) {
+      for (const f of s.files) {
+        if (!f || typeof f.path !== "string" || UNSAFE.test(f.path)) continue;
+        const fc = Buffer.from(f.content || "", "utf8").toString("base64");
+        out.push(["F", s.slug, f.path, fc].join("\t"));
+      }
+    }
+  }
+  process.stdout.write(out.join("\n"));
+' < "$TMPFILE") || {
   echo "MCPmarket sync: invalid response — using cached skills" >&2
   report_failure "invalid_response"
   exit 0
-fi
+}
 
-SKILL_COUNT=$(echo "$RESPONSE" | jq '.data.skills | length')
+# `printf '%s\n'` restores the trailing newline that `$()` strips.
+SKILLS_TSV=$(printf '%s\n' "$RECORDS" | awk -F'\t' '$1=="S" { print $2"\t"$3"\t"$4 }')
+SKILL_COUNT=$(printf '%s\n' "$SKILLS_TSV" | awk 'NF { c++ } END { print c+0 }')
 
 if [ "$SKILL_COUNT" -eq 0 ]; then
   echo "MCPmarket sync: no baseline skills configured"
   exit 0
 fi
 
-# Never overwrite skills that ship with the plugin — server is not
-# authoritative over them.
+# Never overwrite skills that ship with the plugin.
 BUNDLED_SKILLS="sync"
 
 SYNCED_SLUGS=()
 
-# Single jq pass per skill; content base64-encoded so embedded newlines
-# survive the read loop.
-SKILLS_TSV=$(echo "$RESPONSE" | jq -r '
-  .data.skills[]
-  | [.slug, .version, (.content // "" | @base64)]
-  | @tsv
-')
-
 while IFS=$'\t' read -r SLUG VERSION CONTENT_B64; do
   if [ -z "$SLUG" ] || [ "$SLUG" = "null" ]; then
+    continue
+  fi
+
+  # Required: a server-returned `..` would otherwise pivot SKILL_DIR to
+  # $PLUGIN_ROOT and overwrite the agent's startup hook.
+  if ! echo "$SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
+    echo "MCPmarket sync: skipping skill with invalid slug '$SLUG'" >&2
     continue
   fi
 
@@ -191,7 +243,6 @@ while IFS=$'\t' read -r SLUG VERSION CONTENT_B64; do
   SKILL_DIR="$SKILLS_DIR/$SLUG"
   mkdir -p "$SKILL_DIR"
 
-  # Read version stamp from SKILL.md frontmatter to skip up-to-date skills.
   LOCAL_VERSION=""
   if [ -f "$SKILL_DIR/SKILL.md" ]; then
     LOCAL_VERSION=$(awk '
@@ -207,30 +258,33 @@ while IFS=$'\t' read -r SLUG VERSION CONTENT_B64; do
     continue
   fi
 
-  # Atomic write — partial writes can't leave a half-baked SKILL.md.
   if [ -n "$CONTENT_B64" ]; then
     TMP_SKILL="$(mktemp "$SKILL_DIR/SKILL.md.XXXX")"
     printf '%s\n' "$(echo "$CONTENT_B64" | base64 -d)" > "$TMP_SKILL"
     mv "$TMP_SKILL" "$SKILL_DIR/SKILL.md"
   fi
 
-  FILES_TSV=$(echo "$RESPONSE" | jq -r --arg slug "$SLUG" '
-    .data.skills[]
-    | select(.slug == $slug)
-    | .files[]?
-    | [.path, (.content // "" | @base64)]
-    | @tsv
-  ')
+  FILES_TSV=$(printf '%s\n' "$RECORDS" | awk -F'\t' -v slug="$SLUG" '$1=="F" && $2==slug { print $3"\t"$4 }')
   if [ -n "$FILES_TSV" ]; then
     while IFS=$'\t' read -r FILE_PATH FILE_CONTENT_B64; do
       if [ -z "$FILE_PATH" ] || [ "$FILE_PATH" = "null" ]; then
         continue
       fi
 
-      # Path-traversal guard.
-      case "$FILE_PATH" in
-        ../*|*/../*|/*) continue ;;
-      esac
+      # Segment-level path-traversal guard; `case` globs miss bare `..`
+      # and `foo/..`.
+      _PATH_OK=true
+      case "$FILE_PATH" in /*) _PATH_OK=false ;; esac
+      if [ "$_PATH_OK" = "true" ]; then
+        IFS='/' read -ra _SEGS <<<"$FILE_PATH"
+        for _SEG in "${_SEGS[@]}"; do
+          if [ "$_SEG" = ".." ] || [ "$_SEG" = "." ] || [ -z "$_SEG" ]; then
+            _PATH_OK=false
+            break
+          fi
+        done
+      fi
+      if [ "$_PATH_OK" != "true" ]; then continue; fi
 
       FILE_DIR=$(dirname "$SKILL_DIR/$FILE_PATH")
       mkdir -p "$FILE_DIR"
@@ -242,13 +296,14 @@ $FILES_TSV
 EOF
   fi
 
-  # Drop legacy sidecar from older plugin versions.
   rm -f "$SKILL_DIR/.version"
 done <<EOF
 $SKILLS_TSV
 EOF
 
-# Remove skills no longer in the baseline (skip bundled).
+# Cleanup: only delete subdirs whose SKILL.md carries the
+# `mcpmarket-version:` stamp the sync writes, so hand-placed skills
+# survive even if MCPMARKET_SKILLS_DIR is misconfigured.
 if [ -d "$SKILLS_DIR" ] && [ "$SKILLS_DIR" != "/" ]; then
   for EXISTING in "$SKILLS_DIR"/*/; do
     [ -d "$EXISTING" ] || continue
@@ -256,9 +311,16 @@ if [ -d "$SKILLS_DIR" ] && [ "$SKILLS_DIR" != "/" ]; then
     case " $BUNDLED_SKILLS " in
       *" $EXISTING_SLUG "*) continue ;;
     esac
+
+    [ -f "$EXISTING/SKILL.md" ] || continue
+    HAS_STAMP=$(awk '
+      /^---[[:space:]]*$/ { if (in_fm) exit; in_fm=1; next }
+      in_fm && /^[[:space:]]+mcpmarket-version:/ { print "1"; exit }
+    ' "$EXISTING/SKILL.md")
+    [ -n "$HAS_STAMP" ] || continue
+
     FOUND=false
-    # Length check required: bash expands "${empty[@]:-}" to one empty
-    # word, which would match every real slug.
+    # Length check required: `"${empty[@]:-}"` expands to one empty word.
     if [ ${#SYNCED_SLUGS[@]} -gt 0 ]; then
       for S in "${SYNCED_SLUGS[@]}"; do
         if [ "$S" = "$EXISTING_SLUG" ]; then
