@@ -1,66 +1,49 @@
 #!/usr/bin/env bash
-# MCPmarket baseline skill sync (agent-neutral)
-# Called by an agent's SessionStart-equivalent hook (via that agent's
-# hook-shim) to fetch baseline skills from the web app API and write
-# them to the plugin's skills directory for auto-loading.
+# MCPmarket baseline skill sync (agent-neutral).
+# Run by an agent's SessionStart hook (via the agent's hook-shim) to
+# fetch baseline skills for the configured toolkit.
 #
-# Contract — this script reads ONLY these env vars:
-#   MCPMARKET_PLUGIN_ROOT  (required) root of installed plugin dir
-#   MCPMARKET_TOKEN        (optional) bearer token; falls back to .mcp.json
-#   MCPMARKET_TOOLKIT_URL  (optional) toolkit MCP URL; falls back to .mcp.json
-#   MCPMARKET_API_URL      (optional) API base URL override (allowlisted)
-#   MCPMARKET_SKILLS_DIR   (optional) skills dir; default $PLUGIN_ROOT/skills
-#
-# Each agent's hook-shim is responsible for translating its native
-# variables (e.g. CLAUDE_PLUGIN_OPTION_*) into the MCPMARKET_* contract
-# before exec'ing this script.
+# Reads only:
+#   MCPMARKET_PLUGIN_ROOT  (required) plugin install dir
+#   MCPMARKET_TOKEN        bearer token; falls back to .mcp.json
+#   MCPMARKET_TOOLKIT_URL  toolkit MCP URL; falls back to .mcp.json
+#   MCPMARKET_API_URL      API base URL override (allowlisted)
+#   MCPMARKET_SKILLS_DIR   skills dir; default $PLUGIN_ROOT/skills
 
 set -euo pipefail
 
 MCPMARKET_SYNC_VERSION="0.2.0"
 USER_AGENT="mcpmarket-sync/${MCPMARKET_SYNC_VERSION}"
 
-# Originating client surface (claude_desktop, claude_code, codex, gemini).
-# The download-time builder substitutes the placeholder before zipping
-# this script into the user's plugin. Curl-pipe install paths that do
-# not (yet) substitute leave the placeholder intact — sync.sh detects
-# that case below and omits the header so the baseline route records
-# nothing rather than a polluted "__MCPMARKET_CLIENT__" string.
+# Split-literal guard: do NOT collapse to a bare placeholder. The split
+# prevents the build-time substitution from rewriting this comparison
+# along with the assignment above, so unbaked (curl-pipe) installs still
+# detect the placeholder and zero the value.
 MCPMARKET_CLIENT="__MCPMARKET_CLIENT__"
-case "$MCPMARKET_CLIENT" in
-  __MCPMARKET_CLIENT__) MCPMARKET_CLIENT="" ;;
-esac
+if [ "$MCPMARKET_CLIENT" = "__MCPMARKET""_CLIENT__" ]; then
+  MCPMARKET_CLIENT=""
+fi
 
-# PLUGIN_ROOT is normally set by the hook-shim, but when this script is
-# invoked directly (e.g. from a /sync skill via the Bash tool) the env
-# var may be missing. Fall back to deriving the plugin root from this
-# script's own location (shared/sync.sh → ..) so manual invocation
-# works the same as the hook-driven path.
+# Fall back to deriving plugin root from this script's location so
+# direct invocation (e.g. via /sync) works without env vars.
 PLUGIN_ROOT="${MCPMARKET_PLUGIN_ROOT:-}"
 if [ -z "$PLUGIN_ROOT" ]; then
   SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   PLUGIN_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 fi
 
-# Check for jq early — needed for .mcp.json fallback and API response parsing
 if ! command -v jq &>/dev/null; then
   echo "MCPmarket sync: jq not installed — skipping sync" >&2
   exit 0
 fi
 
-# Read from .mcp.json if env vars aren't set (baked-in credentials from download)
 if [ -n "$PLUGIN_ROOT" ] && [ -f "$PLUGIN_ROOT/.mcp.json" ]; then
   MCP_CONFIG="$PLUGIN_ROOT/.mcp.json"
   TOOLKIT_URL="${MCPMARKET_TOOLKIT_URL:-$(jq -r '.mcpServers.mcpmarket.url // empty' "$MCP_CONFIG")}"
-  # Codex's .mcp.json schema uses `http_headers`; Claude's uses `headers`.
-  # Try both so the same sync.sh works under either agent's plugin layout.
+  # Codex uses `http_headers`; Claude uses `headers`. Try both.
   BEARER=$(jq -r '.mcpServers.mcpmarket.http_headers.Authorization // .mcpServers.mcpmarket.headers.Authorization // empty' "$MCP_CONFIG")
   API_TOKEN="${MCPMARKET_TOKEN:-${BEARER#Bearer }}"
 
-  # .mcp.json was present but the credentials couldn't be extracted
-  # (wrong shape, jq returned empty, file hand-edited). Log it as a
-  # distinct failure so debugging doesn't have to guess between "never
-  # configured" and "configured but unreadable".
   if [ -z "$TOOLKIT_URL" ] || [ -z "$API_TOKEN" ]; then
     echo "MCPmarket sync: .mcp.json present but credentials unreadable — skipping sync" >&2
     exit 0
@@ -72,11 +55,8 @@ fi
 
 API_BASE_URL="${MCPMARKET_API_URL:-https://app.mcpmarket.com}"
 
-# Validate api_url before using it as the base for Authorization-bearing
-# requests. Without this, a user socially-engineered into setting
-# MCPMARKET_API_URL=https://attacker.com would exfiltrate their API
-# token on the next sync. Allowlist covers production, any
-# mcpmarket.com subdomain (staging/preview), and localhost for dev.
+# Allowlist API base URL — prevents token exfiltration if a user is
+# tricked into pointing MCPMARKET_API_URL at an attacker host.
 case "$API_BASE_URL" in
   https://app.mcpmarket.com|https://app.mcpmarket.com/*) ;;
   https://*.mcpmarket.com|https://*.mcpmarket.com/*) ;;
@@ -87,14 +67,12 @@ case "$API_BASE_URL" in
     ;;
 esac
 
-# Validate required values
 if [ -z "$TOOLKIT_URL" ] || [ -z "$API_TOKEN" ] || [ -z "$PLUGIN_ROOT" ]; then
   echo "MCPmarket sync: missing configuration — skipping sync" >&2
   exit 0
 fi
 
-# Parse org slug and toolkit slug from MCP URL
-# Format: https://gateway.example.com/{orgSlug}/toolkits/{toolkitSlug}/mcp
+# Toolkit URL format: https://gateway.example.com/{orgSlug}/toolkits/{toolkitSlug}/mcp
 URL_PATH=$(echo "$TOOLKIT_URL" | sed -E 's|https?://[^/]*/||; s|/mcp$||')
 ORG_SLUG=$(echo "$URL_PATH" | cut -d'/' -f1)
 TOOLKIT_SLUG=$(echo "$URL_PATH" | cut -d'/' -f3)
@@ -104,7 +82,6 @@ if [ -z "$ORG_SLUG" ] || [ -z "$TOOLKIT_SLUG" ]; then
   exit 0
 fi
 
-# Validate parsed slugs look reasonable (alphanumeric + hyphens)
 if ! echo "$ORG_SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
   echo "MCPmarket sync: invalid org slug '$ORG_SLUG' — skipping sync" >&2
   exit 0
@@ -115,24 +92,40 @@ if ! echo "$TOOLKIT_SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
 fi
 
 SYNC_URL="${API_BASE_URL}/api/v1/plugin/baseline?org=${ORG_SLUG}&toolkit=${TOOLKIT_SLUG}"
+FAILURE_URL="${API_BASE_URL}/api/v1/plugin/sync-failure"
+
+# Fire-and-forget failure telemetry. Best-effort; cannot fail the hook.
+# Inlined JSON is safe only because reason is a hardcoded literal,
+# slugs are regex-validated, and http_code comes from curl's writer.
+report_failure() {
+  local reason="$1"
+  local http_code="${2:-}"
+  local payload
+  if [ -n "$http_code" ]; then
+    payload=$(printf '{"reason":"%s","orgSlug":"%s","toolkitSlug":"%s","httpCode":%s}' \
+      "$reason" "$ORG_SLUG" "$TOOLKIT_SLUG" "$http_code")
+  else
+    payload=$(printf '{"reason":"%s","orgSlug":"%s","toolkitSlug":"%s"}' \
+      "$reason" "$ORG_SLUG" "$TOOLKIT_SLUG")
+  fi
+  curl -sS --max-time 3 -X POST \
+    -H "Authorization: Bearer $API_TOKEN" \
+    -H "Content-Type: application/json" \
+    -H "User-Agent: $USER_AGENT" \
+    ${CLIENT_HEADER_ARGS[@]+"${CLIENT_HEADER_ARGS[@]}"} \
+    -d "$payload" \
+    "$FAILURE_URL" >/dev/null 2>&1 || true
+}
 
 SKILLS_DIR="${MCPMARKET_SKILLS_DIR:-$PLUGIN_ROOT/skills}"
 mkdir -p "$SKILLS_DIR"
 
-# Fetch baseline skills from API
 TMPFILE=$(mktemp)
 CURL_ERR=$(mktemp)
 trap 'rm -f "$TMPFILE" "$CURL_ERR"' EXIT
 
-# Optional client header — only sent when the download-time substitution
-# baked in a real value. Omitting (rather than sending an empty header)
-# keeps curl's wire format clean and lets the baseline route's "header
-# present?" check stand in for "this install's client identity is known".
-#
-# `${arr[@]+"${arr[@]}"}` is the empty-array-safe expansion under
-# `set -u` — bash 4.2 (macOS default) treats a bare `${arr[@]}` on an
-# empty array as an unbound-variable error, which would abort the
-# script before curl ever ran.
+# `${arr[@]+"${arr[@]}"}` — empty-array-safe expansion under `set -u`
+# (bash 4.2 on macOS errors on bare `${arr[@]}` for empty arrays).
 CLIENT_HEADER_ARGS=()
 if [ -n "$MCPMARKET_CLIENT" ]; then
   CLIENT_HEADER_ARGS=(-H "X-MCPmarket-Client: $MCPMARKET_CLIENT")
@@ -144,25 +137,23 @@ HTTP_CODE=$(curl -sS -o "$TMPFILE" -w '%{http_code}' --max-time 15 \
   -H "User-Agent: $USER_AGENT" \
   ${CLIENT_HEADER_ARGS[@]+"${CLIENT_HEADER_ARGS[@]}"} \
   "$SYNC_URL" 2>"$CURL_ERR") || {
-  # curl exit codes: 6 = could not resolve host, 7 = failed to connect,
-  # 28 = timeout, 35/60 = TLS issues. Capture curl's own message so the
-  # user can act on it instead of guessing which transport-layer thing
-  # is broken.
   ERR=$(tr -d '\n' < "$CURL_ERR" | head -c 200)
   echo "MCPmarket sync: network error — using cached skills (${ERR:-no detail})" >&2
+  report_failure "network_error"
   exit 0
 }
 
 if [ "$HTTP_CODE" != "200" ]; then
   echo "MCPmarket sync: API returned HTTP $HTTP_CODE — using cached skills" >&2
+  report_failure "http_error" "$HTTP_CODE"
   exit 0
 fi
 
 RESPONSE=$(cat "$TMPFILE")
 
-# Validate response
 if ! echo "$RESPONSE" | jq -e '.data.skills' >/dev/null 2>&1; then
   echo "MCPmarket sync: invalid response — using cached skills" >&2
+  report_failure "invalid_response"
   exit 0
 fi
 
@@ -173,21 +164,14 @@ if [ "$SKILL_COUNT" -eq 0 ]; then
   exit 0
 fi
 
-# Skills that ship with the plugin itself — never overwritten by the
-# baseline API and never deleted by the cleanup loop, regardless of
-# what the server returns. This is a trust boundary: a compromised
-# baseline endpoint returning {slug:"sync", content:"<attacker skill>"}
-# would otherwise replace skills/sync/SKILL.md, and the next time the
-# user ran /sync the agent would execute attacker-supplied instructions.
+# Never overwrite skills that ship with the plugin — server is not
+# authoritative over them.
 BUNDLED_SKILLS="sync"
 
-# Track synced slugs for cleanup
 SYNCED_SLUGS=()
 
-# One jq pass per skill — extract slug + version + base64-encoded
-# content so embedded newlines and special characters can ride through
-# the read loop unmodified. Earlier versions of this script forked jq
-# O(n*m) times (per-field per-skill); the change keeps it at O(n).
+# Single jq pass per skill; content base64-encoded so embedded newlines
+# survive the read loop.
 SKILLS_TSV=$(echo "$RESPONSE" | jq -r '
   .data.skills[]
   | [.slug, .version, (.content // "" | @base64)]
@@ -199,8 +183,6 @@ while IFS=$'\t' read -r SLUG VERSION CONTENT_B64; do
     continue
   fi
 
-  # Refuse to write over any bundled skill, even if the server returns
-  # one with the same slug. Mirrors the cleanup-loop guard below.
   case " $BUNDLED_SKILLS " in
     *" $SLUG "*) continue ;;
   esac
@@ -209,11 +191,7 @@ while IFS=$'\t' read -r SLUG VERSION CONTENT_B64; do
   SKILL_DIR="$SKILLS_DIR/$SLUG"
   mkdir -p "$SKILL_DIR"
 
-  # Check if already up-to-date by reading the canonical version stamp
-  # the server wrote into SKILL.md frontmatter at publish time
-  # (`metadata.mcpmarket-version`).  Single source of truth — no separate
-  # sidecar file means the version travels with the SKILL.md when
-  # teammates copy or commit the folder elsewhere.
+  # Read version stamp from SKILL.md frontmatter to skip up-to-date skills.
   LOCAL_VERSION=""
   if [ -f "$SKILL_DIR/SKILL.md" ]; then
     LOCAL_VERSION=$(awk '
@@ -229,18 +207,13 @@ while IFS=$'\t' read -r SLUG VERSION CONTENT_B64; do
     continue
   fi
 
-  # Write entry point (SKILL.md) atomically (write to a temp file in
-  # the destination directory, then rename) so a partial write can't
-  # leave a half-baked SKILL.md that the agent then loads.
+  # Atomic write — partial writes can't leave a half-baked SKILL.md.
   if [ -n "$CONTENT_B64" ]; then
     TMP_SKILL="$(mktemp "$SKILL_DIR/SKILL.md.XXXX")"
     printf '%s\n' "$(echo "$CONTENT_B64" | base64 -d)" > "$TMP_SKILL"
     mv "$TMP_SKILL" "$SKILL_DIR/SKILL.md"
   fi
 
-  # Write resource files. Pull all (path, content) pairs for this skill
-  # in a single jq pass — content is base64-encoded so embedded newlines
-  # / TSV separators can't break the read loop.
   FILES_TSV=$(echo "$RESPONSE" | jq -r --arg slug "$SLUG" '
     .data.skills[]
     | select(.slug == $slug)
@@ -254,7 +227,7 @@ while IFS=$'\t' read -r SLUG VERSION CONTENT_B64; do
         continue
       fi
 
-      # Prevent path traversal
+      # Path-traversal guard.
       case "$FILE_PATH" in
         ../*|*/../*|/*) continue ;;
       esac
@@ -269,28 +242,23 @@ $FILES_TSV
 EOF
   fi
 
-  # Opportunistic cleanup of pre-frontmatter sidecar files left over
-  # from earlier plugin versions.  Idempotent.
+  # Drop legacy sidecar from older plugin versions.
   rm -f "$SKILL_DIR/.version"
 done <<EOF
 $SKILLS_TSV
 EOF
 
-# Remove skills no longer marked as baseline (skip bundled plugin skills,
-# BUNDLED_SKILLS is hoisted above the write loop).
+# Remove skills no longer in the baseline (skip bundled).
 if [ -d "$SKILLS_DIR" ] && [ "$SKILLS_DIR" != "/" ]; then
   for EXISTING in "$SKILLS_DIR"/*/; do
     [ -d "$EXISTING" ] || continue
     EXISTING_SLUG=$(basename "$EXISTING")
-    # Skip bundled skills that ship with the plugin
     case " $BUNDLED_SKILLS " in
       *" $EXISTING_SLUG "*) continue ;;
     esac
     FOUND=false
-    # Guard: bash expands "${empty_array[@]:-}" to a single empty word,
-    # so iterating without a length check would match "" against every
-    # real slug and delete every non-bundled skill when the API returns
-    # all-null-slug responses.
+    # Length check required: bash expands "${empty[@]:-}" to one empty
+    # word, which would match every real slug.
     if [ ${#SYNCED_SLUGS[@]} -gt 0 ]; then
       for S in "${SYNCED_SLUGS[@]}"; do
         if [ "$S" = "$EXISTING_SLUG" ]; then

@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
+# Maps Gemini CLI's contract onto the agent-neutral MCPMARKET_* contract,
+# then runs shared/sync.sh.
+#
+# Gemini sets no plugin-root env var on hook processes — it passes the
+# resolved path as $1 (via `${extensionPath}` in hooks.json). Fall back
+# to deriving from this script's location for direct invocation.
+# MCPMARKET_TOKEN / MCPMARKET_TOOLKIT_URL / MCPMARKET_API_URL come from
+# Gemini's settings system and pass through unchanged.
 set -euo pipefail
-# Map Gemini CLI's contract to the agent-neutral MCPMARKET_* contract.
-#
-# Gemini does NOT set an env var like GEMINI_EXTENSION_ROOT for hook
-# processes. Instead, the manifest uses ${extensionPath} string
-# substitution at hydration time — it's gone by the time bash runs.
-# The hooks.json command passes the resolved extension path as $1, and
-# we also fall back to deriving it from this script's own location so
-# direct invocation (e.g. from a /sync skill) still works.
-#
-# MCPMARKET_TOKEN, MCPMARKET_TOOLKIT_URL, and MCPMARKET_API_URL are
-# already in the environment thanks to Gemini's `settings` array — they
-# pass through unchanged.
 
 if [ "$#" -ge 1 ] && [ -n "$1" ]; then
   PLUGIN_ROOT="$1"
