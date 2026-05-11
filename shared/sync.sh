@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-MCPMARKET_SYNC_VERSION="0.4.0"
+MCPMARKET_SYNC_VERSION="0.5.0"
 USER_AGENT="mcpmarket-sync/${MCPMARKET_SYNC_VERSION}"
 
 # Split literal so the build-time substitution can't rewrite the
@@ -113,17 +113,20 @@ if [ -z "$ORG_SLUG" ] || [ -z "$TOOLKIT_SLUG" ]; then
   exit 0
 fi
 
-if ! echo "$ORG_SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
+# Slug pattern matches server `slugSchema` (min 2 chars, no trailing dash) so
+# a slug that passes here also passes the route's Zod validation.
+if ! echo "$ORG_SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*[a-z0-9]$'; then
   echo "MCPmarket sync: invalid org slug '$ORG_SLUG' — skipping sync" >&2
   exit 0
 fi
-if ! echo "$TOOLKIT_SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
+if ! echo "$TOOLKIT_SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*[a-z0-9]$'; then
   echo "MCPmarket sync: invalid toolkit slug '$TOOLKIT_SLUG' — skipping sync" >&2
   exit 0
 fi
 
 SYNC_URL="${API_BASE_URL}/api/v1/plugin/baseline?org=${ORG_SLUG}&toolkit=${TOOLKIT_SLUG}"
 FAILURE_URL="${API_BASE_URL}/api/v1/plugin/sync-failure"
+SYNC_APPLIED_URL="${API_BASE_URL}/api/v1/plugin/sync-applied"
 
 # Fire-and-forget telemetry. Inlined JSON is safe only because reason
 # is a hardcoded literal, slugs are regex-validated, http_code comes
@@ -188,6 +191,7 @@ fi
 # records by smuggling \n into a slug or path.
 RECORDS=$(node -e '
   const UNSAFE = /[\t\n\x00]/;
+  const crypto = require("crypto");
   let raw;
   try { raw = require("fs").readFileSync(0, "utf8"); } catch { process.exit(1); }
   let r;
@@ -199,8 +203,18 @@ RECORDS=$(node -e '
     if (!s || typeof s.slug !== "string" || UNSAFE.test(s.slug)) continue;
     const version = s.version || "";
     if (UNSAFE.test(version)) continue;
-    const c = Buffer.from(s.content || "", "utf8").toString("base64");
-    out.push(["S", s.slug, version, c].join("\t"));
+    const content = s.content || "";
+    const c = Buffer.from(content, "utf8").toString("base64");
+    // Hash the *normalized* bytes the bash write path produces, not the
+    // raw server content. Bash command substitution `$(...)` strips all
+    // trailing newlines, and `printf '%s\n'` then appends exactly one —
+    // so what lands on disk is always `content with trailing \n+
+    // collapsed to one`. Hashing the raw server bytes here would flag
+    // every freshly-written file as diverged whenever the server sent
+    // content without exactly one trailing newline.
+    const normalized = content.replace(/\n+$/, "") + "\n";
+    const sha = crypto.createHash("sha256").update(normalized, "utf8").digest("hex");
+    out.push(["S", s.slug, version, c, sha].join("\t"));
     if (Array.isArray(s.files)) {
       for (const f of s.files) {
         if (!f || typeof f.path !== "string" || UNSAFE.test(f.path)) continue;
@@ -217,12 +231,17 @@ RECORDS=$(node -e '
 }
 
 # `printf '%s\n'` restores the trailing newline that `$()` strips.
-SKILLS_TSV=$(printf '%s\n' "$RECORDS" | awk -F'\t' '$1=="S" { print $2"\t"$3"\t"$4 }')
+SKILLS_TSV=$(printf '%s\n' "$RECORDS" | awk -F'\t' '$1=="S" { print $2"\t"$3"\t"$4"\t"$5 }')
 SKILL_COUNT=$(printf '%s\n' "$SKILLS_TSV" | awk 'NF { c++ } END { print c+0 }')
 
 if [ "$SKILL_COUNT" -eq 0 ]; then
   echo "MCPmarket sync: no baseline skills configured"
-  exit 0
+  # Fall through to the cleanup pass + sync_applied POST. If the user
+  # had skills synced before the toolkit's baseline was emptied, the
+  # cleanup loop still needs to delete them; and the server still
+  # wants a delta event so "this user has the plugin but their
+  # toolkit is empty" shows up in analytics instead of looking like
+  # silence.
 fi
 
 # Never overwrite skills that ship with the plugin.
@@ -230,14 +249,28 @@ BUNDLED_SKILLS="sync"
 
 SYNCED_SLUGS=()
 
-while IFS=$'\t' read -r SLUG VERSION CONTENT_B64; do
+# Sync delta counters. The server-side `plugin.sync` heartbeat only
+# knows what it sent — it can't see what was on disk before. These
+# counters capture that delta so the sync_applied POST below can
+# answer "does sync change anything for this user?".
+SKILLS_NEW=0
+SKILLS_UPDATED=0
+SKILLS_UNCHANGED=0
+SKILLS_REMOVED=0
+# `skills_diverged` is a *subset* of `skills_unchanged` — version stamp
+# matches the server's, but the on-disk content has been edited locally.
+# Recorded for divergence-rate analytics; sync intentionally does NOT
+# overwrite (users may legitimately customize installed skills).
+SKILLS_DIVERGED=0
+
+while IFS=$'\t' read -r SLUG VERSION CONTENT_B64 EXPECTED_SHA; do
   if [ -z "$SLUG" ] || [ "$SLUG" = "null" ]; then
     continue
   fi
 
   # Required: a server-returned `..` would otherwise pivot SKILL_DIR to
   # $PLUGIN_ROOT and overwrite the agent's startup hook.
-  if ! echo "$SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*$'; then
+  if ! echo "$SLUG" | grep -qE '^[a-z0-9][a-z0-9-]*[a-z0-9]$'; then
     echo "MCPmarket sync: skipping skill with invalid slug '$SLUG'" >&2
     continue
   fi
@@ -251,6 +284,7 @@ while IFS=$'\t' read -r SLUG VERSION CONTENT_B64; do
   mkdir -p "$SKILL_DIR"
 
   LOCAL_VERSION=""
+  LOCAL_HAS_STAMP=""
   if [ -f "$SKILL_DIR/SKILL.md" ]; then
     LOCAL_VERSION=$(awk '
       /^---[[:space:]]*$/ { if (in_fm) { exit } else { in_fm=1; next } }
@@ -260,16 +294,64 @@ while IFS=$'\t' read -r SLUG VERSION CONTENT_B64; do
         print; exit
       }
     ' "$SKILL_DIR/SKILL.md")
+    if [ -n "$LOCAL_VERSION" ]; then
+      LOCAL_HAS_STAMP="1"
+    fi
   fi
   if [ -n "$LOCAL_VERSION" ] && [ "$LOCAL_VERSION" = "$VERSION" ]; then
+    # Version stamp matches. Check whether content has drifted from
+    # what we sent — record-only, no overwrite, no user-visible warning.
+    # Hashing prefers `shasum -a 256` (BSD/macOS default) over
+    # `sha256sum` (GNU/Linux) so the check works on both without an
+    # extra dependency; node fallback covers exotic environments.
+    LOCAL_SHA=""
+    if command -v shasum >/dev/null 2>&1; then
+      LOCAL_SHA=$(shasum -a 256 "$SKILL_DIR/SKILL.md" 2>/dev/null | awk '{print $1}')
+    elif command -v sha256sum >/dev/null 2>&1; then
+      LOCAL_SHA=$(sha256sum "$SKILL_DIR/SKILL.md" 2>/dev/null | awk '{print $1}')
+    else
+      LOCAL_SHA=$(SKILL_PATH="$SKILL_DIR/SKILL.md" node -e '
+        try {
+          const fs = require("fs");
+          const crypto = require("crypto");
+          const data = fs.readFileSync(process.env.SKILL_PATH);
+          process.stdout.write(crypto.createHash("sha256").update(data).digest("hex"));
+        } catch { process.exit(0); }
+      ' 2>/dev/null)
+    fi
+    if [ -n "$LOCAL_SHA" ] && [ -n "$EXPECTED_SHA" ] && [ "$LOCAL_SHA" != "$EXPECTED_SHA" ]; then
+      SKILLS_DIVERGED=$((SKILLS_DIVERGED + 1))
+    fi
+    SKILLS_UNCHANGED=$((SKILLS_UNCHANGED + 1))
     continue
   fi
 
-  if [ -n "$CONTENT_B64" ]; then
-    TMP_SKILL="$(mktemp "$SKILL_DIR/SKILL.md.XXXX")"
-    printf '%s\n' "$(echo "$CONTENT_B64" | base64 -d)" > "$TMP_SKILL"
-    mv "$TMP_SKILL" "$SKILL_DIR/SKILL.md"
+  # Symmetric with the cleanup pass: only overwrite skills the sync owns
+  # (i.e. ones it previously stamped). A hand-placed `skills/<slug>/`
+  # without a `mcpmarket-version:` stamp must not be clobbered just
+  # because the catalog later adds a slug with the same name.
+  if [ -f "$SKILL_DIR/SKILL.md" ] && [ -z "$LOCAL_HAS_STAMP" ]; then
+    echo "MCPmarket sync: skipping '$SLUG' — local SKILL.md has no mcpmarket-version stamp (hand-placed)" >&2
+    continue
   fi
+
+  # Only count + write when the server actually sent content. An empty
+  # CONTENT_B64 with no local SKILL.md would otherwise increment
+  # SKILLS_NEW on every sync without ever writing, making the delta
+  # event lie about on-disk state.
+  if [ -z "$CONTENT_B64" ]; then
+    continue
+  fi
+
+  if [ -z "$LOCAL_VERSION" ]; then
+    SKILLS_NEW=$((SKILLS_NEW + 1))
+  else
+    SKILLS_UPDATED=$((SKILLS_UPDATED + 1))
+  fi
+
+  TMP_SKILL="$(mktemp "$SKILL_DIR/SKILL.md.XXXX")"
+  printf '%s\n' "$(echo "$CONTENT_B64" | base64 -d)" > "$TMP_SKILL"
+  mv "$TMP_SKILL" "$SKILL_DIR/SKILL.md"
 
   FILES_TSV=$(printf '%s\n' "$RECORDS" | awk -F'\t' -v slug="$SLUG" '$1=="F" && $2==slug { print $3"\t"$4 }')
   if [ -n "$FILES_TSV" ]; then
@@ -338,8 +420,32 @@ if [ -d "$SKILLS_DIR" ] && [ "$SKILLS_DIR" != "/" ]; then
     fi
     if [ "$FOUND" = "false" ]; then
       rm -rf "$EXISTING"
+      SKILLS_REMOVED=$((SKILLS_REMOVED + 1))
     fi
   done
 fi
+
+# Sync delta POST. Pure non-negative counters; no slugs or paths in the
+# payload so the metadata shape stays uniform across users. Counters
+# above are bash arithmetic so the format strings are integer-safe.
+# `client` is in the body (not just the header) because the
+# /sync-applied route reads it from the validated body — without this
+# every event from a client-specific install loses metadata.client.
+client_suffix=""
+if [ -n "$MCPMARKET_CLIENT" ]; then
+  client_suffix=$(printf ',"client":"%s"' "$MCPMARKET_CLIENT")
+fi
+SYNC_APPLIED_PAYLOAD=$(printf '{"orgSlug":"%s","toolkitSlug":"%s","skillsNew":%d,"skillsUpdated":%d,"skillsUnchanged":%d,"skillsRemoved":%d,"skillsDiverged":%d%s}' \
+  "$ORG_SLUG" "$TOOLKIT_SLUG" \
+  "$SKILLS_NEW" "$SKILLS_UPDATED" "$SKILLS_UNCHANGED" "$SKILLS_REMOVED" "$SKILLS_DIVERGED" \
+  "$client_suffix")
+
+curl -sS --max-time 3 -X POST \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "User-Agent: $USER_AGENT" \
+  ${CLIENT_HEADER_ARGS[@]+"${CLIENT_HEADER_ARGS[@]}"} \
+  -d "$SYNC_APPLIED_PAYLOAD" \
+  "$SYNC_APPLIED_URL" >/dev/null 2>&1 || true
 
 echo "MCPmarket sync: $SKILL_COUNT baseline skill(s) synced"
