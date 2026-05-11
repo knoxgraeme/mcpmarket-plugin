@@ -126,19 +126,20 @@ SYNC_URL="${API_BASE_URL}/api/v1/plugin/baseline?org=${ORG_SLUG}&toolkit=${TOOLK
 FAILURE_URL="${API_BASE_URL}/api/v1/plugin/sync-failure"
 
 # Fire-and-forget telemetry. Inlined JSON is safe only because reason
-# is a hardcoded literal, slugs are regex-validated, and http_code
-# comes from curl's writer.
+# is a hardcoded literal, slugs are regex-validated, http_code comes
+# from curl's writer, and MCPMARKET_CLIENT is validated at the top of
+# this script (reset to "" when the build-time substitution placeholder
+# is detected, so it is always a valid enum value or empty string).
 report_failure() {
   local reason="$1"
   local http_code="${2:-}"
+  local http_code_frag=""
+  local client_frag=""
+  [ -n "$http_code" ] && http_code_frag=$(printf ',"httpCode":%s' "$http_code")
+  [ -n "$MCPMARKET_CLIENT" ] && client_frag=$(printf ',"client":"%s"' "$MCPMARKET_CLIENT")
   local payload
-  if [ -n "$http_code" ]; then
-    payload=$(printf '{"reason":"%s","orgSlug":"%s","toolkitSlug":"%s","httpCode":%s}' \
-      "$reason" "$ORG_SLUG" "$TOOLKIT_SLUG" "$http_code")
-  else
-    payload=$(printf '{"reason":"%s","orgSlug":"%s","toolkitSlug":"%s"}' \
-      "$reason" "$ORG_SLUG" "$TOOLKIT_SLUG")
-  fi
+  payload=$(printf '{"reason":"%s","orgSlug":"%s","toolkitSlug":"%s"%s%s}' \
+    "$reason" "$ORG_SLUG" "$TOOLKIT_SLUG" "$http_code_frag" "$client_frag")
   curl -sS --max-time 3 -X POST \
     -H "Authorization: Bearer $API_TOKEN" \
     -H "Content-Type: application/json" \
