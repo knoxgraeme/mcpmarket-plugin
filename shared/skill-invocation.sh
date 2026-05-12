@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# MCPmarket skill-invocation telemetry hook (agent-neutral).
-# Wired as a PostToolUse hook with matcher "Skill" — Claude Code's
-# matcher filters exclusively, so this script only runs when the Skill
-# tool is invoked, not on every tool call.
+# MCPmarket skill-invocation telemetry hook.
+# Wired as PostToolUse + PostToolUseFailure hooks with matcher "Skill"
+# — Claude Code's matcher filters exclusively, so this script only runs
+# when the Skill tool is invoked, not on every tool call. Both events
+# share this script because the classifier handles either shape;
+# without the PostToolUseFailure wiring every failed invocation would
+# drop on the floor.
 #
 # Reads the hook input JSON from stdin. Fires a single fire-and-forget
 # POST to /api/v1/plugin/skill-invocation with:
 #   - skill_slug   (from tool_input)
-#   - source       (user|agent — resolved by tailing transcript_path
-#                   for <command-name>$slug</command-name>; the prompt
-#                   itself never leaves the user's machine)
+#   - source       (user|agent — prefers the native `invocation_trigger`
+#                   field on the hook input; falls back on older Claude
+#                   Code versions to tailing transcript_path for
+#                   <command-name>$slug</command-name>. The prompt text
+#                   never leaves the user's machine — only the source
+#                   bit travels.)
 #   - outcome      (success|error — derived from tool_response shape)
 #   - error_class  (closed enum, only when outcome=error)
 #
@@ -65,39 +71,56 @@ FIELDS=$(HOOK_JSON="$HOOK_INPUT" node -e '
     const ti = h.tool_input || {};
     const skill = clean(ti.skill || ti.name || "");
     const transcript = clean(h.transcript_path || "");
+    // `invocation_trigger` is emitted by Claude Code alongside the
+    // `claude_code.skill_activated` OTel event and is the formal source
+    // of truth for whether the skill came from a user slash command, an
+    // autonomous agent decision, or a nested skill invocation. Older
+    // Claude Code versions do not populate it — the bash side falls
+    // back to the transcript-tail heuristic when this field is empty.
+    const trigger = clean(h.invocation_trigger || "");
     let outcome = "success";
     let errorClass = "";
+    // Hook input may carry the failure signal in two places:
+    //   - PostToolUse with error: tool_response = { is_error: true, error/message/content: "..." }
+    //   - PostToolUseFailure:     top-level `error` string, no tool_response
+    // Either is treated as a failure; the message source is whichever is
+    // present (tool_response fields preferred when both exist). The
+    // classifier vocabulary is identical so analytics queries do not have
+    // to split on event source.
+    const classify = (raw) => {
+      const s = String(raw || "").toLowerCase();
+      if (s.includes("not found") || s.includes("unknown skill")) return "not_found";
+      if (s.includes("timeout") || s.includes("timed out")) return "timeout";
+      if (s) return "runtime_error";
+      // Errored but no extractable message — shape drifted; route to
+      // `unknown` so the regression surfaces in analytics.
+      return "unknown";
+    };
     const resp = h.tool_response;
-    if (!resp || typeof resp !== "object") {
-      // Missing tool_response is itself signal: tool execution crashed
-      // before producing a response, or the Claude Code hook-input shape
-      // drifted in a release. Record as error/unknown rather than
-      // silently rolling up as success.
-      outcome = "error";
-      errorClass = "unknown";
-    } else {
+    const topError = typeof h.error === "string" ? h.error : "";
+    if (resp && typeof resp === "object") {
       const errored = resp.is_error === true || resp.success === false || !!resp.error;
       if (errored) {
         outcome = "error";
-        const raw = String(resp.error || resp.message || resp.content || "").toLowerCase();
-        if (raw.includes("not found") || raw.includes("unknown skill")) {
-          errorClass = "not_found";
-        } else if (raw.includes("timeout") || raw.includes("timed out")) {
-          errorClass = "timeout";
-        } else if (raw) {
-          errorClass = "runtime_error";
-        } else {
-          // Errored but no extractable message — tool_response shape
-          // changed; route to `unknown` so the regression surfaces.
-          errorClass = "unknown";
-        }
+        errorClass = classify(resp.error || resp.message || resp.content || topError);
       }
+    } else if (topError) {
+      // PostToolUseFailure shape: no tool_response, top-level error string.
+      outcome = "error";
+      errorClass = classify(topError);
+    } else {
+      // No tool_response AND no top-level error — either Claude Code
+      // crashed before producing any failure signal, or the hook-input
+      // shape drifted in a release. Record as error/unknown rather than
+      // silently rolling up as success.
+      outcome = "error";
+      errorClass = "unknown";
     }
-    process.stdout.write([toolName, skill, transcript, outcome, errorClass].join("\x1F"));
+    process.stdout.write([toolName, skill, transcript, trigger, outcome, errorClass].join("\x1F"));
   } catch { process.exit(1); }
 ') || exit 0
 
-IFS=$'\x1F' read -r TOOL_NAME SKILL_SLUG TRANSCRIPT_PATH OUTCOME ERROR_CLASS <<<"$FIELDS"
+IFS=$'\x1F' read -r TOOL_NAME SKILL_SLUG TRANSCRIPT_PATH INVOCATION_TRIGGER OUTCOME ERROR_CLASS <<<"$FIELDS"
 
 # Defence-in-depth: matcher should already restrict to Skill, but a
 # misconfigured hooks.json shouldn't let arbitrary tool calls fire
@@ -174,34 +197,56 @@ elif [ "$API_SCHEME" = "http" ]; then
 fi
 [ "$API_ALLOWED" = "true" ] || exit 0
 
-# Source attribution. Tail the JSONL transcript, walk backwards to the
-# most recent user message, look for the <command-name>$SKILL_SLUG tag
-# Claude Code injects when the user types a slash command. The prompt
-# text is consumed locally and discarded — only the source bit travels.
+# Source attribution. Prefer Claude Code's native `invocation_trigger`
+# field (emitted alongside the `claude_code.skill_activated` OTel event)
+# when present — it's the formal source of truth and avoids the
+# transcript-tail heuristic's misattribution of the second-and-onward
+# agent re-invocation of the same skill in one user turn. On older
+# Claude Code versions the field is absent; fall back to tailing the
+# JSONL transcript for a `<command-name>$SKILL_SLUG` tag in the most
+# recent user message. The prompt text is consumed locally and
+# discarded — only the source bit travels.
+#
+# The trigger string literals below are a Claude Code wire-format
+# contract. The same three values appear in two test sites that lock
+# the mapping; keep all three in sync when Claude Code adds a new
+# trigger value:
+#   - apps/web/lib/__tests__/plugin-source.test.ts (case-arm regex)
+#   - apps/web/lib/plugin-template/__tests__/skill-invocation.test.ts (it.each table)
 SOURCE="agent"
-if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
-  LAST_USER=$(tail -n 50 "$TRANSCRIPT_PATH" 2>/dev/null | TARGET_SLUG="$SKILL_SLUG" node -e '
-    const target = process.env.TARGET_SLUG;
-    const lines = require("fs").readFileSync(0, "utf8").split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      let obj;
-      try { obj = JSON.parse(line); } catch { continue; }
-      const role = obj.role || (obj.message && obj.message.role) || obj.type;
-      if (role !== "user") continue;
-      const content = obj.message ? obj.message.content : obj.content;
-      const text = typeof content === "string" ? content : JSON.stringify(content || "");
-      if (text.includes("<command-name>" + target + "</command-name>")) {
-        process.stdout.write("user");
-      }
-      process.exit(0);
-    }
-  ' 2>/dev/null || true)
-  if [ "$LAST_USER" = "user" ]; then
+case "$INVOCATION_TRIGGER" in
+  user-slash)
     SOURCE="user"
-  fi
-fi
+    ;;
+  claude-proactive|nested-skill)
+    SOURCE="agent"
+    ;;
+  *)
+    if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+      LAST_USER=$(tail -n 50 "$TRANSCRIPT_PATH" 2>/dev/null | TARGET_SLUG="$SKILL_SLUG" node -e '
+        const target = process.env.TARGET_SLUG;
+        const lines = require("fs").readFileSync(0, "utf8").split("\n");
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          let obj;
+          try { obj = JSON.parse(line); } catch { continue; }
+          const role = obj.role || (obj.message && obj.message.role) || obj.type;
+          if (role !== "user") continue;
+          const content = obj.message ? obj.message.content : obj.content;
+          const text = typeof content === "string" ? content : JSON.stringify(content || "");
+          if (text.includes("<command-name>" + target + "</command-name>")) {
+            process.stdout.write("user");
+          }
+          process.exit(0);
+        }
+      ' 2>/dev/null || true)
+      if [ "$LAST_USER" = "user" ]; then
+        SOURCE="user"
+      fi
+    fi
+    ;;
+esac
 
 # Build JSON payload. Inline interpolation is safe: every field above
 # has been regex-validated (skill/org/toolkit slugs) or is sourced from
