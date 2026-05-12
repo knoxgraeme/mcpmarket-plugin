@@ -51,10 +51,13 @@ HOOK_INPUT=$(cat)
 # across Claude Code versions, so the error detection is permissive:
 # any of `is_error`, `error`, or `success === false` flags an error.
 # Skill slug source: tool_input.skill (canonical) or tool_input.name.
-# All string fields are scrubbed of \t/\n/\x00 to keep the downstream
-# TAB-separated readline safe.
+# All string fields are scrubbed of separator characters (\t/\n/\x00/\x1F)
+# so a forged value can't smuggle extra positional fields. \x1F (Unit
+# Separator) is used as the inter-field delimiter — see sync.sh for the
+# rationale (tab is IFS-whitespace and bash `read` compacts consecutive
+# tabs, so an empty middle field would shift later fields left).
 FIELDS=$(HOOK_JSON="$HOOK_INPUT" node -e '
-  const UNSAFE = /[\t\n\x00]/;
+  const UNSAFE = /[\t\n\x00\x1F]/;
   const clean = (s) => (typeof s === "string" && !UNSAFE.test(s) ? s : "");
   try {
     const h = JSON.parse(process.env.HOOK_JSON);
@@ -67,7 +70,7 @@ FIELDS=$(HOOK_JSON="$HOOK_INPUT" node -e '
     const resp = h.tool_response;
     if (!resp || typeof resp !== "object") {
       // Missing tool_response is itself signal: tool execution crashed
-      // before producing a response, or Claude Code's hook-input shape
+      // before producing a response, or the Claude Code hook-input shape
       // drifted in a release. Record as error/unknown rather than
       // silently rolling up as success.
       outcome = "error";
@@ -90,11 +93,11 @@ FIELDS=$(HOOK_JSON="$HOOK_INPUT" node -e '
         }
       }
     }
-    process.stdout.write([toolName, skill, transcript, outcome, errorClass].join("\t"));
+    process.stdout.write([toolName, skill, transcript, outcome, errorClass].join("\x1F"));
   } catch { process.exit(1); }
 ') || exit 0
 
-IFS=$'\t' read -r TOOL_NAME SKILL_SLUG TRANSCRIPT_PATH OUTCOME ERROR_CLASS <<<"$FIELDS"
+IFS=$'\x1F' read -r TOOL_NAME SKILL_SLUG TRANSCRIPT_PATH OUTCOME ERROR_CLASS <<<"$FIELDS"
 
 # Defence-in-depth: matcher should already restrict to Skill, but a
 # misconfigured hooks.json shouldn't let arbitrary tool calls fire

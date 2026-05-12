@@ -184,13 +184,20 @@ if [ "$HTTP_CODE" != "200" ]; then
   exit 0
 fi
 
-# Single node pass emits TSV records the bash loop below consumes:
-#   S<TAB><slug><TAB><version><TAB><base64-content>
-#   F<TAB><slug><TAB><path><TAB><base64-content>
-# Rejects \t/\n/\x00 in string fields so a server can't forge extra
-# records by smuggling \n into a slug or path.
+# Single node pass emits records the bash loop below consumes. Inter-field
+# delimiter is \x1F (Unit Separator) — tab is IFS-whitespace and bash
+# `read` collapses runs of tabs, so an empty middle field (e.g. server
+# emits a skill with no version) would shift later fields left and
+# corrupt downstream parsing. \x1F is non-whitespace and preserves
+# empty fields. Same rationale as the .mcp.json credential parser above.
+#   S<US><slug><US><version><US><base64-content><US><sha>
+#   F<US><slug><US><path><US><base64-content>
+# Rejects \t/\n/\x00/\x1F in string fields so a server can't forge extra
+# records by smuggling \n into a slug or path or smuggling \x1F to
+# create extra positional fields.
+US=$'\x1F'
 RECORDS=$(node -e '
-  const UNSAFE = /[\t\n\x00]/;
+  const UNSAFE = /[\t\n\x00\x1F]/;
   const crypto = require("crypto");
   let raw;
   try { raw = require("fs").readFileSync(0, "utf8"); } catch { process.exit(1); }
@@ -214,12 +221,12 @@ RECORDS=$(node -e '
     // content without exactly one trailing newline.
     const normalized = content.replace(/\n+$/, "") + "\n";
     const sha = crypto.createHash("sha256").update(normalized, "utf8").digest("hex");
-    out.push(["S", s.slug, version, c, sha].join("\t"));
+    out.push(["S", s.slug, version, c, sha].join("\x1F"));
     if (Array.isArray(s.files)) {
       for (const f of s.files) {
         if (!f || typeof f.path !== "string" || UNSAFE.test(f.path)) continue;
         const fc = Buffer.from(f.content || "", "utf8").toString("base64");
-        out.push(["F", s.slug, f.path, fc].join("\t"));
+        out.push(["F", s.slug, f.path, fc].join("\x1F"));
       }
     }
   }
@@ -231,7 +238,7 @@ RECORDS=$(node -e '
 }
 
 # `printf '%s\n'` restores the trailing newline that `$()` strips.
-SKILLS_TSV=$(printf '%s\n' "$RECORDS" | awk -F'\t' '$1=="S" { print $2"\t"$3"\t"$4"\t"$5 }')
+SKILLS_TSV=$(printf '%s\n' "$RECORDS" | awk -F"$US" -v US="$US" '$1=="S" { print $2 US $3 US $4 US $5 }')
 SKILL_COUNT=$(printf '%s\n' "$SKILLS_TSV" | awk 'NF { c++ } END { print c+0 }')
 
 if [ "$SKILL_COUNT" -eq 0 ]; then
@@ -263,7 +270,7 @@ SKILLS_REMOVED=0
 # overwrite (users may legitimately customize installed skills).
 SKILLS_DIVERGED=0
 
-while IFS=$'\t' read -r SLUG VERSION CONTENT_B64 EXPECTED_SHA; do
+while IFS=$'\x1F' read -r SLUG VERSION CONTENT_B64 EXPECTED_SHA; do
   if [ -z "$SLUG" ] || [ "$SLUG" = "null" ]; then
     continue
   fi
@@ -353,9 +360,9 @@ while IFS=$'\t' read -r SLUG VERSION CONTENT_B64 EXPECTED_SHA; do
   printf '%s\n' "$(echo "$CONTENT_B64" | base64 -d)" > "$TMP_SKILL"
   mv "$TMP_SKILL" "$SKILL_DIR/SKILL.md"
 
-  FILES_TSV=$(printf '%s\n' "$RECORDS" | awk -F'\t' -v slug="$SLUG" '$1=="F" && $2==slug { print $3"\t"$4 }')
+  FILES_TSV=$(printf '%s\n' "$RECORDS" | awk -F"$US" -v US="$US" -v slug="$SLUG" '$1=="F" && $2==slug { print $3 US $4 }')
   if [ -n "$FILES_TSV" ]; then
-    while IFS=$'\t' read -r FILE_PATH FILE_CONTENT_B64; do
+    while IFS=$'\x1F' read -r FILE_PATH FILE_CONTENT_B64; do
       if [ -z "$FILE_PATH" ] || [ "$FILE_PATH" = "null" ]; then
         continue
       fi
