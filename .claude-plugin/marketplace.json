@@ -1,0 +1,14 @@
+{
+  "name": "mcpmarket-plugin",
+  "description": "Connect Claude Code sessions to MCPmarket skills via MCP",
+  "owner": {
+    "name": "MCPmarket",
+    "url": "https://mcpmarket.com"
+  },
+  "plugins": [
+    {
+      "name": "mcpmarket-plugin",
+      "source": "./templates/claude"
+    }
+  ]
+}
